@@ -1,0 +1,45 @@
+name: panel_data
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python
+  - ipykernel
+  - ipython
+  - jupyter_client
+  - jupyter_core
+  - matplotlib-inline
+  - numpy
+  - pandas
+  - pip
+  - pyzmq
+  - setuptools
+  - sqlite
+  - tornado
+  - traitlets
+  - typing_extensions
+  - wheel
+  - zlib
+  - pip:
+      - accelerate
+      - aiohttp
+      - huggingface-hub
+      - langchain
+      - numpy
+      - pandas
+      - pydantic
+      - requests
+      - torch
+      - torchaudio
+      - torchvision
+      - transformers
+      - scikit-learn
+      - seaborn
+      - tqdm
+      - langchain
+      - langchain-community
+      - langchain-core
+      - langchain-text-splitters
+      - langsmith
+      - missforest
+      - miceforest
