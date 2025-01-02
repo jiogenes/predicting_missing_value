@@ -43,3 +43,4 @@ dependencies:
       - langsmith
       - missforest
       - miceforest
+      - rank-bm25
