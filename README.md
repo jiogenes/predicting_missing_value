@@ -85,7 +85,7 @@ python langraph_cos_fixed_useful.py --query_code SATIS_W116 --top_k 25 --n_shot 
 
 **Example Command**:
 ```bash
-python langraph_cos_fixed_useful_gpt.py --query_code DRLEAD_W116 --top_k 25 --n_shot 2 --output_file useful_gpt_results
+python langraph_cos_fixed_useful_gpt.py --query_code SATIS_W116 --top_k 25 --n_shot 2 --output_file useful_gpt_results
 ```
 
 ## Usage Details
