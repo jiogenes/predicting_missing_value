@@ -86,7 +86,7 @@ def generate_llm_answer(messages, max_new_tokens):
 # Few-shot 응답자 선정 및 응답자 응답 추출
 def retrieve_responses(state: GraphState) -> GraphState:
     question = retriever.meta.column_names_to_labels[query_code].replace(f'{query_code}. ', '').strip()
-    # 로우의 값만 가지고 바로 코사인 유사도 계산
+    # using cosine similarity to find similar users
     state['few_shot_users'] = retriever.find_similar_users_with_cosine_similarity(state["user"], top_k=state['n_shot'])
     few_shot_demographics = []
     few_shot_responses = []
@@ -95,10 +95,9 @@ def retrieve_responses(state: GraphState) -> GraphState:
     cache_path = "cache/naive_qna/"
     options = [option for option in retriever.meta.value_labels[retriever.meta.variable_to_label[query_code]].values() if "Don't know/No Answer" not in option and "Refused" not in option and "Other" not in option]
 
-    # useful question 뽑아놓은거 가져오기
+    # naive question
     cache = os.path.join(cache_path, f'naive_qna_{query_code}.pkl')
     if os.path.exists(os.path.join(cache_path, f'naive_qna_{query_code}.pkl')):
-        # print(f'Loading useful qna from cache...')
         with open(os.path.join(cache_path, f'naive_qna_{query_code}.pkl'), 'rb') as f:
             bge_retrieved_qnas = pickle.load(f)
     else:
@@ -168,11 +167,8 @@ def main(args):
 
     workflow = StateGraph(GraphState)
     workflow.add_node("retrieve", retrieve_responses)
-    # workflow.add_node("relevance_check", relevance_check)
     workflow.add_node("llm_answer", llm_answer)
     workflow.add_edge("retrieve", "llm_answer")
-    # workflow.add_edge("retrieve", "relevance_check")
-    # workflow.add_edge("relevance_check", "llm_answer")
     workflow.set_entry_point("retrieve")
 
     memory = MemorySaver()
