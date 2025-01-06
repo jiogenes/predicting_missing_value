@@ -6,7 +6,7 @@ import pickle
 import numpy as np
 import os
 import torch
-from transformers import T5ForSequenceClassification, T5Tokenizer, AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel
 
 # Assuming these functions are provided as described
 categories = [
@@ -34,82 +34,6 @@ def create_user_metadata(row, question_mapping, response_mapping):
             continue
         sentence_parts.append(f"{question}: {answer}")
     return ", ".join(sentence_parts)
-
-class T5Retriever:
-    def __init__(self, model_name="./CRAG/finetuned_t5_evaluator", data_path="/data/matmang/ATP W117.sav", device='cuda', top_n=5):
-        self.device = device if torch.cuda.is_available() else 'cpu'
-        self.tokenizer = T5Tokenizer.from_pretrained(model_name)
-        self.model = T5ForSequenceClassification.from_pretrained(model_name, output_hidden_states=True).to(self.device)
-        self.data_path = data_path
-        self.top_n = top_n
-        self.df, self.meta = self._load_data()
-        self.question_mapping = self.meta.column_names_to_labels
-        self.response_mapping = self.meta.variable_value_labels
-        self.columns_to_drop = [
-            'QKEY', 'INTERVIEW_START_W117', 'INTERVIEW_END_W117',
-            'WEIGHT_W117', 'WEIGHT_W117_VOTE', 'LANG_W117',
-            'FORM_W117', 'DEVICE_TYPE_W117', 'XTABLET_W117', 'F_METRO',
-            'F_CREGION', 'F_CDIVISION', 'F_USR_SELFID', 'F_AGECAT',
-            'F_GENDER', 'F_EDUCCAT', 'F_EDUCCAT2', 'F_HISP',
-            'F_HISP_ORIGIN', 'F_YEARSINUS_RECODE', 'F_RACECMB',
-            'F_RACETHNMOD', 'F_CITIZEN', 'F_BIRTHPLACE', 'F_MARITAL',
-            'F_RELIG', 'F_BORN', 'F_RELIGCAT1', 'F_RELTRAD', 'F_ATTEND',
-            'F_PARTY_FINAL', 'F_PARTYLN_FINAL', 'F_PARTYSUM_FINAL',
-            'F_PARTYSUMIDEO_FINAL', 'F_REG', 'F_INC_SDT1', 'F_IDEO',
-            'F_INTFREQ', 'F_VOLSUM', 'F_INC_TIER2'
-        ]
-        self._preprocess_data()
-
-    def _load_data(self):
-        df, meta = pyreadstat.read_sav(self.data_path)
-        return df, meta
-
-    def _preprocess_data(self):
-        self.df = self.df.drop(columns=self.columns_to_drop)
-
-    def _get_question_and_answers_excluding_target(self, row, query_code):
-        responses = []
-        for question_code in row.index:
-            if question_code == query_code:
-                continue
-            question = self.question_mapping.get(question_code, "Question code not found")
-            # question_code와 일치하는 부분 제거
-            if question_code in question:
-                question = question.replace(question_code + ". ", "")
-            answers = self.response_mapping.get(question_code, {})
-            actual_answer = row[question_code]
-            if pd.isna(actual_answer):
-                continue
-            actual_answer_text = answers.get(actual_answer, actual_answer) if isinstance(answers, dict) else actual_answer
-            responses.append((question, actual_answer_text))
-        return responses
-
-    def select_relevants(self, responses, query, top_n=None):
-        top_n = self.top_n
-        max_length = 512
-        responses_data = []
-        for i, r in enumerate(responses):
-            input_content = query + " [SEP] " + f'Q : {r[0]} A : {r[1]}'
-            inputs = self.tokenizer(input_content, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length)
-            try:
-                with torch.no_grad():
-                    outputs = self.model(inputs["input_ids"].to(self.device), attention_mask=inputs["attention_mask"].to(self.device))
-                scores = float(outputs["logits"].cpu())
-            except:
-                scores = -1.0
-            responses_data.append((scores, r, i))
-        sorted_results = sorted(responses_data, key=lambda x: x[0], reverse=True)
-        ctxs = [f'Q : {s[1][0]} A : {s[1][1]}' for s in sorted_results[:top_n]]
-        idxs = [str(s[2]) for s in sorted_results]
-        return ctxs, idxs
-
-    def response_refinement(self, query, user, query_code):
-        top_n = self.top_n
-
-        rsps = self._get_question_and_answers_excluding_target(user, query_code)
-        results, idxs = self.select_relevants(responses=rsps, query=query, top_n=top_n)
-
-        return results
 
 class BGERetriever:
     def __init__(self, model_name="BAAI/bge-m3", data_path="/data/matmang/ATP W117.sav", device='cuda', top_n=5, query_code='POL1JB_W116', target_indices=None):
@@ -291,11 +215,7 @@ class BGERetriever:
 
         df = pd.DataFrame(self.df, dtype=np.float32, copy=True)
 
-        # print(target_user_idx)
-        # print(True if target_user_idx in df.index else False)
-        # print(df.index.tolist())
         target_user_row = torch.tensor(np.nan_to_num(df.loc[target_user_idx].values), dtype=torch.float32)
-        # users_row_df = df.iloc[np.r_[0:target_user_idx, target_user_idx+1:len(df)]]
         users_row_df = df.drop(index=target_user_idx)
         similarities = [
             (index, calculate_cosine_similarity(

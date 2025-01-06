@@ -19,6 +19,9 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 from langchain_core.runnables import RunnableConfig
 from sklearn.metrics import classification_report
+from langchain_openai import ChatOpenAI
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 
 from retrievers import BGERetriever
 
@@ -52,67 +55,54 @@ class GraphState(TypedDict):
     n_shot: int
 
 def generate_llm_answer(messages, max_new_tokens):
-    input_ids = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        return_tensors="pt"
-    ).to(model.device)
+    chain = messages | model | StrOutputParser()
 
-    terminators = [
-        tokenizer.eos_token_id,
-        tokenizer.convert_tokens_to_ids("<|eot_id|>")
-    ]
+    answer = chain.invoke({})
+    prompt_string = ""
 
-    outputs = model.generate(
-        input_ids,
-        eos_token_id=terminators,
-        pad_token_id=tokenizer.eos_token_id,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        top_p=None,
-        top_k=None,
-        temperature=None,
-    )
+    for role in messages.messages:
+        if isinstance(role, SystemMessagePromptTemplate):
+            prompt_string += "system\n\n"
+            prompt_string += role.prompt.template + "\n\n"
+        elif isinstance(role, HumanMessagePromptTemplate):
+            prompt_string += "user\n\n"
+            prompt_string += role.prompt.template + "\n\n"
+    
+    prompt_string += answer
 
-    prompt = outputs[0][:input_ids.shape[-1]]
-    response = outputs[0][input_ids.shape[-1]:]
-
-    prompt = tokenizer.decode(prompt, skip_special_tokens=True)
-    response = tokenizer.decode(response, skip_special_tokens=True)
-
-    return prompt, response
+    return prompt_string, answer
 
 
 # Few-shot 응답자 선정 및 응답자 응답 추출
 def retrieve_responses(state: GraphState) -> GraphState:
     question = retriever.meta.column_names_to_labels[query_code].replace(f'{query_code}. ', '').strip()
-    # 로우의 값만 가지고 바로 코사인 유사도 계산
-    state['few_shot_users'] = retriever.find_similar_users_with_cosine_similarity(state["user"], top_k=state['n_shot'], balance=True)
+    # using cosine similarity to find similar users
+    state['few_shot_users'] = retriever.find_similar_users_with_cosine_similarity(state["user"], top_k=state['n_shot'])
     few_shot_demographics = []
     few_shot_responses = []
     few_shot_useful_responses = []
     few_shot_actual_answers = []
-    cache_path = "cache/useful_description/"
+    cache_path = "cache/naive_qna/"
     options = [option for option in retriever.meta.value_labels[retriever.meta.variable_to_label[query_code]].values() if "Don't know/No Answer" not in option and "Refused" not in option and "Other" not in option]
 
-    # useful question 뽑아놓은거 가져오기
-    cache = os.path.join(cache_path, f'useful_qna_{query_code}.pkl')
-    if os.path.exists(os.path.join(cache_path, f'useful_qna_{query_code}.pkl')):
+    # naive question
+    cache = os.path.join(cache_path, f'naive_qna_{query_code}.pkl')
+    if os.path.exists(os.path.join(cache_path, f'naive_qna_{query_code}.pkl')):
         # print(f'Loading useful qna from cache...')
-        with open(os.path.join(cache_path, f'useful_qna_{query_code}.pkl'), 'rb') as f:
-            similar_qnas = pickle.load(f)
+        with open(os.path.join(cache_path, f'naive_qna_{query_code}.pkl'), 'rb') as f:
+            bge_retrieved_qnas = pickle.load(f)
     else:
         print("fail")
 
     for user in state["few_shot_users"]:
-        few_shot_responses.append(similar_qnas[user])
+        few_shot_responses.append(bge_retrieved_qnas[user][:state['top_k']])
         few_shot_actual_answers.append(retriever.response_mapping[query_code][retriever.df.loc[user][query_code]])
         few_shot_useful_responses.append([])
 
     return GraphState(
         question=question,
         options=options,
-        user_response=similar_qnas[state["user"]],
+        user_response=bge_retrieved_qnas[state["user"]][:state['top_k']],
         user=state["user"],
         few_shot_users=state["few_shot_users"],
         few_shot_demographics=few_shot_demographics,
@@ -122,61 +112,41 @@ def retrieve_responses(state: GraphState) -> GraphState:
         few_shot_useful_responses=few_shot_useful_responses)
 
 
-def extract_questions_in_response(result):
-    matches = []
-    pattern = re.compile(r'\d+\.\s.*?(?=\d+\.\s|$)', re.DOTALL)
-    for line in result.split('\n'):
-        match = pattern.findall(line)
-        if match:
-            match = match[0].split(".", 1)[1].strip()
-            matches.append(match)
-
-    assert matches
-    return matches
-
-
-# 20개 응답 중에서 10개 고르기
-def relevance_check(state: GraphState) -> GraphState:
-    question  = state["question"]
-    few_shot_responses = state["few_shot_responses"]
-
-
-    selected_responses = []
-    for survey_responses in few_shot_responses + [state["user_response"]]:
-        survey_responses = '\n'.join(survey_responses)
-        messages = [
-            {"role": "system", "content": f"Your task is to select {state['top_k']} useful responses from the user's survey responses to answer the question.\n\nHere's how you should proceed:\n1. Analyze the provided question to understand its theme and context.\n2. Select most relevant responses that would logically accompany the provided question in a survey responses.\n3. Do not say anything other than user survey responses in your response.\n4. You have to number the responses in order of importance.\n5. If you don't have {state['top_k']} questions that you think would be useful, be sure to fill out the {state['top_k']} questions."},
-            {"role": "user", "content": f"Provided question is:\n{question}\n\nUser survey responses:\n{survey_responses}"}
-        ]
-
-        prompt, response = generate_llm_answer(messages=messages, max_new_tokens=1024)
-        selected_responses.append(extract_questions_in_response(response))
-
-    state['few_shot_responses'] = selected_responses[:-1]
-    state["user_response"] = selected_responses[-1]
-
-    return GraphState(**state)
-
-
 def llm_answer(state: GraphState) -> GraphState:
     question = state["question"]
     user_response = '\n'.join(state["user_response"])
     options = '\n'.join(state["options"])
 
-    messages = [
-        {"role": "system", "content": f"You are tasked with predicting responses to targeted user survey questions through given user survey questions-responses. Read the provided user survey questions-responses and use it to select the most appropriate response from the given options to the target question. Ensure that your output includes only the selected response and does not include any additional comments, explanations, or questions. Choose the appropriate answer to the following target question from the following options. \n\nTarget question:\n{question}\n\nOptions:\n{options}"},
-        {"role": "user", "content": f"Now, read the following target user survey responses and query, and select the most appropriate response from the given options based on the other responses.\nRefer to the answers provided by respondents similar to the user provided above.\nEnsure that your output includes only in Options:\nUser survey responses:\n{user_response}\n\nAnswer:"},
-    ]
-
-    # few-shot 추가하는 부분
+   # Few-shot examples 생성
     if state['few_shot_responses']:
         few_shot_examples = "Here are examples of respondents similar to this user:\n"
-
         for idx, (response, answer) in enumerate(zip(state["few_shot_responses"], state["few_shot_actual_answers"])):
             responses = '\n'.join(response)
-            few_shot_examples += f"User {idx + 1}'s survey responses:\n{responses}\n\nAnswer:{answer}\n\n"
+            few_shot_examples += f"User {idx + 1}'s survey responses:\n{responses}\n\nAnswer: {answer}\n\n"
 
-        messages.insert(1, {"role": "user", "content": few_shot_examples})
+    # SystemMessage 템플릿
+    system_message = SystemMessagePromptTemplate.from_template(
+        f"You are tasked with predicting responses to targeted user survey questions through given user survey questions-responses. Read the provided user survey questions-responses and use it to select the most appropriate response from the given options to the target question. Ensure that your output includes only the selected response and does not include any additional comments, explanations, or questions. Choose the appropriate answer to the following target question from the following options. \n\nTarget question:\n{question}\n\nOptions:\n{options}"
+    )
+
+    # Few-shot examples 추가
+    if state['few_shot_responses']:
+        few_shot_message = HumanMessagePromptTemplate.from_template(few_shot_examples)
+    else:
+        few_shot_message = None
+
+    # HumanMessage 템플릿
+    human_message = HumanMessagePromptTemplate.from_template(
+        f"Now, read the following target user survey responses and query, and select the most appropriate response from the given options based on the other responses.\nRefer to the answers provided by respondents similar to the user provided above.\nEnsure that your output includes only in Options:\nUser survey responses:\n{user_response}\n\nAnswer:"
+    )
+
+    # ChatPromptTemplate 생성
+    if few_shot_message:
+        messages = ChatPromptTemplate.from_messages([system_message, few_shot_message, human_message])
+    else:
+        messages = ChatPromptTemplate.from_messages([system_message, human_message])
+
+    # prompt를 사용해 질문을 구성할 수 있습니다.
 
     prompt, response = generate_llm_answer(messages=messages, max_new_tokens=256)
     answer = response
@@ -198,17 +168,14 @@ def llm_answer(state: GraphState) -> GraphState:
     return GraphState(answer=answer, prompt=prompt)
 
 def main(args):
-    global query_code, retriever, tokenizer, model
+    global query_code, retriever, tokenizer, model, prompts
 
     query_code = args['query_code']
 
     workflow = StateGraph(GraphState)
     workflow.add_node("retrieve", retrieve_responses)
-    workflow.add_node("relevance_check", relevance_check)
     workflow.add_node("llm_answer", llm_answer)
-    # workflow.add_edge("retrieve", "llm_answer")
-    workflow.add_edge("retrieve", "relevance_check")
-    workflow.add_edge("relevance_check", "llm_answer")
+    workflow.add_edge("retrieve", "llm_answer")
     workflow.set_entry_point("retrieve")
 
     memory = MemorySaver()
@@ -242,11 +209,11 @@ def main(args):
         try:
             output = app.invoke(inputs, config=config)
             generated_answers.append(output["answer"])
-            prompts.append(output["prompt"])
+            prompts.append(output['prompt'])
         except GraphRecursionError as e:
             failed_user.append(user_id)
             generated_answers.append(output["answer"])
-            prompts.append(output["prompt"])
+            prompts.append(output['prompt'])
             print(f"Recursion limit reached: {e}")
 
     real_answers = []
@@ -275,7 +242,7 @@ def main(args):
 
     report = classification_report(real_answers, generated_answers, output_dict=True, zero_division=0)
     macro_avg_f1 = report['macro avg']['f1-score']
-    print(macro_avg_f1)
+    print(f'F1 score : {macro_avg_f1}')
     return macro_avg_f1
 
 if __name__ == "__main__":
@@ -293,15 +260,15 @@ if __name__ == "__main__":
         'top_k': args.top_k,
         'n_shot': args.n_shot
     }
-
-    model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda:0"
+    model = ChatOpenAI(
+        model="gpt-4-turbo",
+        temperature=0,
+        max_tokens=None,
+        timeout=None,
+        max_retries=2
     )
     retriever = BGERetriever(top_n=10, data_path="./W116_Oct22/ATP W116.sav", query_code=query_code)
+    prompts = []
 
     results = []
     for top_k, n_shot in itertools.product(*param_grid.values()):
@@ -312,16 +279,21 @@ if __name__ == "__main__":
             results.append((top_k, n_shot, macro_avg_f1))
         except Exception as e:
             error_message = f"Error occurred with parameters: {params}\nException: {str(e)}"
-            asyncio.run(send_discord_alert(message=error_message))
-            continue
+            # asyncio.run(send_discord_alert(message=error_message))
+            raise
 
     # 결과를 데이터프레임으로 변환
     df_results = pd.DataFrame(results, columns=['top_k', 'n_shot', 'macro_avg_f1'])
     df_results.to_csv(args.output_file + f'_{query_code}_{args.top_k}_{args.n_shot}.csv', index=False)
 
+    # 결과 출력
+    print(df_results)
+
     # 그래프 그리기
     sns.set_theme(style="whitegrid")
     plt.figure(figsize=(12, 8))
+
+    # 그래프 그리기
     palette = sns.color_palette("husl", len(df_results['n_shot'].unique()))
     line_styles = ['-', '--', '-.', ':']
 
@@ -341,4 +313,4 @@ if __name__ == "__main__":
     except:
         plt.savefig(args.output_file + f'_{query_code}.png')
 
-    asyncio.run(send_discord_alert(message='Done!'))
+    # asyncio.run(send_discord_alert(message='Done!'))
